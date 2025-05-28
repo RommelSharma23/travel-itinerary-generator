@@ -1,7 +1,7 @@
 // frontend/src/api.ts
 
 // Use your actual Render backend URL
-const API_BASE_URL = 'https://travel-itinerary-generator-xayl.onrender.com/api';
+const API_BASE_URL = 'https://travel-itinerary-backend-p3xi.onrender.com';
 
 export interface TripData {
   customerName: string;
