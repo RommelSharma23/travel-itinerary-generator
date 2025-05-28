@@ -155,13 +155,49 @@ const mergePDFs = async (itineraryPdfBuffer) => {
   }
 };
 
+// CORS Configuration - IMPORTANT for Render deployment
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    // Allow your frontend URL and localhost for development
+    const allowedOrigins = [
+      'https://travel-itinerary-frontend-bsw1.onrender.com',
+      'http://localhost:3000',
+      'http://localhost:3001'
+    ];
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.log('CORS blocked origin:', origin);
+      callback(null, true); // Allow all origins for now - you can restrict later
+    }
+  },
+  credentials: false,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+  optionsSuccessStatus: 200
+};
+
 // Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Serve static files from public directory
 app.use('/public', express.static('public'));
+
+// Add request logging middleware
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  console.log('Headers:', req.headers);
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log('Body keys:', Object.keys(req.body));
+  }
+  next();
+});
 
 // Configure multer for file uploads (company logos)
 const storage = multer.diskStorage({
@@ -196,11 +232,26 @@ const upload = multer({
 
 // Routes
 app.get('/', (req, res) => {
-  res.json({ message: 'Travel Itinerary Generator API' });
+  res.json({ 
+    message: 'Travel Itinerary Generator API',
+    status: 'Running',
+    timestamp: new Date().toISOString(),
+    environment: NODE_ENV
+  });
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
 });
 
 // Check default logo endpoint
 app.get('/api/check-logo', (req, res) => {
+  console.log('Checking logo endpoint called');
   const logoPath = getDefaultLogoPath();
   res.json({ 
     hasLogo: logoPath !== null, 
@@ -211,6 +262,7 @@ app.get('/api/check-logo', (req, res) => {
 // Upload logo endpoint
 app.post('/api/upload-logo', upload.single('logo'), (req, res) => {
   try {
+    console.log('Logo upload endpoint called');
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
@@ -221,19 +273,31 @@ app.post('/api/upload-logo', upload.single('logo'), (req, res) => {
       path: `/public/uploads/${req.file.filename}`
     });
   } catch (error) {
+    console.error('Logo upload error:', error);
     res.status(500).json({ error: 'Failed to upload logo' });
   }
 });
 
-// Generate PDF endpoint
+// Generate PDF endpoint - MAIN FUNCTIONALITY
 app.post('/api/generate-pdf', async (req, res) => {
+  console.log('=== PDF Generation Request Started ===');
+  
   try {
     const tripData = req.body;
-    console.log('Received trip data:', tripData);
+    console.log('Received trip data keys:', Object.keys(tripData));
+    console.log('Customer name:', tripData.customerName);
+    console.log('Destination:', tripData.destination);
 
     // Validate required fields
     if (!tripData.customerName || !tripData.destination) {
-      return res.status(400).json({ error: 'Customer name and destination are required' });
+      console.log('Validation failed: Missing required fields');
+      return res.status(400).json({ 
+        error: 'Customer name and destination are required',
+        received: {
+          customerName: !!tripData.customerName,
+          destination: !!tripData.destination
+        }
+      });
     }
 
     // Get default logo path for PDF
@@ -242,7 +306,14 @@ app.post('/api/generate-pdf', async (req, res) => {
 
     // Read HTML template
     const templatePath = path.join(__dirname, 'templates', 'itinerary-template.html');
+    console.log('Template path:', templatePath);
+    
+    if (!fs.existsSync(templatePath)) {
+      throw new Error(`Template file not found at: ${templatePath}`);
+    }
+    
     let htmlTemplate = fs.readFileSync(templatePath, 'utf8');
+    console.log('Template loaded, length:', htmlTemplate.length);
 
     // Replace template variables with actual data
     htmlTemplate = htmlTemplate.replace(/{{customerName}}/g, tripData.customerName || '');
@@ -258,6 +329,8 @@ app.post('/api/generate-pdf', async (req, res) => {
     // Handle daily itinerary with logos on every page break
     let itineraryHtml = '';
     if (tripData.dailyItinerary && tripData.dailyItinerary.length > 0) {
+      console.log('Processing daily itinerary:', tripData.dailyItinerary.length, 'days');
+      
       tripData.dailyItinerary.forEach((day, index) => {
         // Estimate content length to determine if we need a page break
         const titleLength = day.title ? day.title.length : 0;
@@ -315,7 +388,16 @@ app.post('/api/generate-pdf', async (req, res) => {
     
     const browser = await puppeteer.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ]
     });
     
     const page = await browser.newPage();
@@ -337,52 +419,77 @@ app.post('/api/generate-pdf', async (req, res) => {
     });
     
     await browser.close();
-    console.log('Base PDF generated successfully');
+    console.log('Base PDF generated successfully, size:', pdf.length);
 
-    // Merge the generated PDF with static pages
-    console.log('Starting PDF merge process...');
+    // Try to merge with static pages, but don't fail if it doesn't work
+    let finalPdf = pdf;
     
     try {
-      const finalPdf = await mergePDFs(pdf);
+      console.log('Attempting to merge with static PDF pages...');
+      finalPdf = await mergePDFs(pdf);
       console.log('PDF merging completed successfully');
-
-      // Send merged PDF as response
-      const filename = `itinerary-${tripData.customerName.replace(/\s+/g, '-')}-${Date.now()}.pdf`;
-      
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      res.send(finalPdf);
-      
     } catch (mergeError) {
-      console.error('PDF merge failed, sending original PDF:', mergeError.message);
-      
-      // Fallback: send original PDF without merging
-      const filename = `itinerary-${tripData.customerName.replace(/\s+/g, '-')}-${Date.now()}.pdf`;
-      
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      res.send(pdf);
+      console.warn('PDF merge failed, using original PDF:', mergeError.message);
+      // Continue with original PDF
     }
 
+    // Send PDF response
+    const filename = `itinerary-${tripData.customerName.replace(/\s+/g, '-')}-${Date.now()}.pdf`;
+    console.log('Sending PDF response, filename:', filename);
+    
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', finalPdf.length);
+    res.send(finalPdf);
+    
+    console.log('=== PDF Generation Request Completed Successfully ===');
+
   } catch (error) {
+    console.error('=== PDF Generation Error ===');
     console.error('Error generating PDF:', error);
     console.error('Full error stack:', error.stack);
-    res.status(500).json({ error: 'Failed to generate PDF: ' + error.message });
+    console.error('=== End PDF Generation Error ===');
+    
+    res.status(500).json({ 
+      error: 'Failed to generate PDF: ' + error.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
+  console.error('Global error handler:', error);
+  
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({ error: 'File too large. Maximum size is 5MB.' });
     }
   }
-  res.status(500).json({ error: error.message });
+  
+  res.status(500).json({ 
+    error: error.message,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  console.log('404 - Route not found:', req.method, req.originalUrl);
+  res.status(404).json({ 
+    error: 'Route not found',
+    path: req.originalUrl,
+    method: req.method,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Start server
 app.listen(PORT, () => {
+  console.log('=================================');
   console.log(`Server is running on port ${PORT}`);
-  console.log(`Visit http://localhost:${PORT} to test the API`);
+  console.log(`Environment: ${NODE_ENV}`);
+  console.log(`Server URL: ${SERVER_URL}`);
+  console.log(`Visit ${SERVER_URL} to test the API`);
+  console.log('=================================');
 });
